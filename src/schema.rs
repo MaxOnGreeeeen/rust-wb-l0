@@ -2,7 +2,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CreateOrderDTO {
     pub track_number: String,
     pub entry: String,
@@ -18,7 +18,40 @@ pub struct CreateOrderDTO {
     pub oof_shard: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Order {
+    pub order_uid: Uuid,
+    pub track_number: String,
+    pub entry: String,
+    pub locale: String,
+    pub internal_signature: String,
+    pub customer_id: String,
+    pub delivery_service: String,
+    pub sm_id: i32,
+    pub date_created: NaiveDateTime,
+    pub shardkey: String,
+    pub oof_shard: String,
+}
+
+impl From<tokio_postgres::Row> for Order {
+    fn from(value: tokio_postgres::Row) -> Self {
+        Self {
+            order_uid: value.get(0),
+            track_number: value.get(1),
+            entry: value.get(2),
+            locale: value.get(3),
+            internal_signature: value.get(4),
+            customer_id: value.get(5),
+            delivery_service: value.get(6),
+            sm_id: value.get(7),
+            date_created: value.get(8),
+            shardkey: value.get(9),
+            oof_shard: value.get(10),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct GetOrderDTO {
     pub order_uid: String,
     pub track_number: String,
@@ -37,7 +70,7 @@ pub struct GetOrderDTO {
 }
 impl GetOrderDTO {
     pub fn from_row(
-        row: &tokio_postgres::Row,
+        row: tokio_postgres::Row,
         payment: PaymentDTO,
         delivery: DeliveryDTO,
         order_items: Vec<OrderItemDTO>,
@@ -63,6 +96,30 @@ impl GetOrderDTO {
             oof_shard: row.get(10),
         };
     }
+
+    pub fn from_order(
+        order: Order,
+        payment: PaymentDTO,
+        delivery: DeliveryDTO,
+        order_items: Vec<OrderItemDTO>,
+    ) -> GetOrderDTO {
+        return GetOrderDTO {
+            order_uid: order.order_uid.to_string(),
+            track_number: order.track_number,
+            entry: order.entry,
+            delivery,
+            payment,
+            items: order_items,
+            locale: order.locale,
+            internal_signature: order.internal_signature,
+            customer_id: order.customer_id,
+            delivery_service: order.delivery_service,
+            shardkey: order.shardkey,
+            sm_id: order.sm_id,
+            date_created: order.date_created.to_string(),
+            oof_shard: order.oof_shard,
+        };
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -70,7 +127,7 @@ pub struct OrderItemId {
     item_id: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct OrderItemDTO {
     pub chrt_id: i64,
     pub track_number: String,
@@ -83,6 +140,24 @@ pub struct OrderItemDTO {
     pub nm_id: i64,
     pub brand: String,
     pub status: i32,
+}
+
+impl From<tokio_postgres::Row> for OrderItemDTO {
+    fn from(value: tokio_postgres::Row) -> Self {
+        Self {
+            chrt_id: value.get(0),
+            track_number: value.get(1),
+            price: value.get(2),
+            rid: value.get(3),
+            name: value.get(4),
+            sale: value.get(5),
+            size: value.get(6),
+            total_price: value.get(7),
+            nm_id: value.get(8),
+            brand: value.get(9),
+            status: value.get(10),
+        }
+    }
 }
 
 impl From<&tokio_postgres::Row> for OrderItemDTO {
@@ -103,7 +178,7 @@ impl From<&tokio_postgres::Row> for OrderItemDTO {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DeliveryDTO {
     pub name: String,
     pub phone: String,
@@ -128,7 +203,7 @@ impl From<tokio_postgres::Row> for DeliveryDTO {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct PaymentDTO {
     pub transaction: String,
     pub request_id: String,

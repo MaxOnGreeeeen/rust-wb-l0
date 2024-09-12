@@ -1,14 +1,17 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     routing::{get, post},
     Router,
 };
+use cache::Cache;
 use errors::{api_fallback, AppError};
 use migrate::Migration;
+use schema::GetOrderDTO;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 
+mod cache;
 mod errors;
 mod fill_test_data;
 mod migrate;
@@ -51,6 +54,7 @@ pub struct Args {
 
 pub struct AppState {
     db: Arc<Mutex<Client>>,
+    cache: Arc<Mutex<Cache<GetOrderDTO>>>,
 }
 
 // Создание роутера
@@ -76,8 +80,10 @@ async fn main() -> Result<(), AppError> {
         }
     });
 
+    let cache: Cache<GetOrderDTO> = cache::Cache::new();
     let app_state = Arc::new(AppState {
         db: Arc::new(Mutex::new(client)),
+        cache: Arc::new(Mutex::new(cache)),
     });
 
     match args_arc.migration.clone().unwrap_or(Migration::None) {
@@ -108,6 +114,17 @@ async fn main() -> Result<(), AppError> {
             let _ = fill_test_data::fill_test_data(args_arc_clone).await;
 
             warn!("End testing");
+        });
+    }
+    {
+        let cache_clone = app_state.cache.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(900));
+            // Подчищаем кеш каждые 15 минут
+            loop {
+                interval.tick().await;
+                cache_clone.lock().await.cleanup_expired();
+            }
         });
     }
 

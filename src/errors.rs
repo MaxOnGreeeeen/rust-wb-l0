@@ -1,7 +1,8 @@
 use axum::{http::StatusCode, Json};
+use log::error;
 use serde_json::json;
 use thiserror::Error;
-use tokio_postgres::Error as PgError;
+use tokio_postgres::{Error as PgError, Transaction};
 
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -23,37 +24,43 @@ pub fn handle_db_error(err: PgError) -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response))
 }
 
-pub fn handle_create_order_error(err: AppError) -> (StatusCode, Json<serde_json::Value>) {
+// Функция для обработки ошибок транзакции
+pub async fn handle_transaction_error<E>(
+    err: E,
+    transaction: Transaction<'_>,
+    message: &str,
+) -> (StatusCode, Json<serde_json::Value>)
+where
+    E: std::fmt::Debug + std::fmt::Display,
+{
+    // Пытаемся откатить транзакцию
+    if let Err(rollback_err) = transaction.rollback().await {
+        error!("Failed to rollback transaction: {:?}", rollback_err);
+    }
+
+    error!("{}: {}", message, err);
+
     let error_response = json!({
         "status": "error",
-        "message": format!("Create order error: {:?}", err),
+        "message": message,
+        "details": err.to_string()
     });
 
     (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response))
 }
 
-pub fn handle_create_delivery_error(err: PgError) -> (StatusCode, Json<serde_json::Value>) {
+// Функция для обработки ошибок получения элементов
+pub async fn handle_get_request_error<E>(
+    err: E,
+    message: &str,
+) -> (StatusCode, Json<serde_json::Value>)
+where
+    E: std::fmt::Debug + std::fmt::Display,
+{
+    error!("{}: {}", message, err);
+
     let error_response = json!({
-        "status": "error",
-        "message": format!("Create order error: {:?}", err),
-    });
-
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response))
-}
-
-pub fn handle_create_payment_error(err: PgError) -> (StatusCode, Json<serde_json::Value>) {
-    let error_response = json!({
-        "status": "error",
-        "message": format!("Create payment error: {:?}", err),
-    });
-
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response))
-}
-
-pub fn handle_create_order_items(err: PgError) -> (StatusCode, Json<serde_json::Value>) {
-    let error_response = json!({
-        "status": "error",
-        "message": format!("Create items error: {:?}", err),
+        "error": message,
     });
 
     (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response))

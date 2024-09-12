@@ -1,11 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
-    errors::{
-        handle_create_delivery_error, handle_create_order_error, handle_create_order_items,
-        handle_create_payment_error, handle_db_error, AppError,
-    },
-    schema::{DeliveryDTO, GetOrderDTO, OrderItemDTO, PaymentDTO},
+    errors::{handle_db_error, handle_get_request_error, handle_transaction_error, AppError},
+    schema::{DeliveryDTO, GetOrderDTO, Order, OrderItemDTO, PaymentDTO},
 };
 
 use axum::{
@@ -34,60 +31,65 @@ pub async fn create_order_handler(
         Err(err) => return Err(handle_db_error(err)),
     };
 
-    let created_order_uuid = match create_order(&mut transaction, &body).await {
-        Ok(order_uuid) => order_uuid,
+    // Создание order
+    let created_order = match OrderService::create_one(&mut transaction, &body, &[]).await {
+        Ok(order) => order,
         Err(err) => {
-            if let Err(rollback_err) = transaction.rollback().await {
-                error!("Failed to rollback transaction: {:?}", rollback_err);
-            }
-            error!("Create order error: {}", err);
-
-            return Err(handle_create_order_error(err));
+            return Err(handle_transaction_error(err, transaction, "Create order error").await);
         }
     };
+    let created_order_uuid = created_order.order_uid;
 
-    let create_delivery_res =
-        create_delivery(&mut transaction, &body.delivery, &created_order_uuid).await;
-    if let Err(err) = create_delivery_res {
-        if let Err(rollback_err) = transaction.rollback().await {
-            error!(
-                "Failed to rollback transaction after delivery error: {:?}",
-                rollback_err
-            );
-        }
-        error!("Create delivery error");
+    // Создание delivery
+    let created_delivery =
+        match DeliveryService::create_one(&mut transaction, &body.delivery, &[&created_order_uuid])
+            .await
+        {
+            Ok(delivery) => delivery,
+            Err(err) => {
+                return Err(
+                    handle_transaction_error(err, transaction, "Create delivery error").await,
+                );
+            }
+        };
 
-        return Err(handle_create_delivery_error(err));
-    }
+    // Создание payment
+    let created_payment =
+        match PaymentService::create_one(&mut transaction, &body.payment, &[&created_order_uuid])
+            .await
+        {
+            Ok(payment) => payment,
+            Err(err) => {
+                return Err(
+                    handle_transaction_error(err, transaction, "Create payment error").await,
+                );
+            }
+        };
 
-    let create_payment_res =
-        create_payment(&mut transaction, &body.payment, &created_order_uuid).await;
-    if let Err(err) = create_payment_res {
-        if let Err(rollback_err) = transaction.rollback().await {
-            error!(
-                "Failed to rollback transaction after payment error: {:?}",
-                rollback_err
-            );
-        }
-        error!("Create payment error, {}", err);
+    // Создание items
+    let created_order_items =
+        match OrderItemsService::create_many(&mut transaction, &body.items, &[&created_order_uuid])
+            .await
+        {
+            Ok(items) => items,
+            Err(err) => {
+                return Err(handle_transaction_error(err, transaction, "Create items error").await);
+            }
+        };
 
-        return Err(handle_create_payment_error(err));
-    }
+    let order = GetOrderDTO::from_order(
+        created_order,
+        created_payment,
+        created_delivery,
+        created_order_items,
+    );
 
-    let create_order_items_res =
-        create_order_items(&mut transaction, &body.items, &created_order_uuid).await;
-    if let Err(err) = create_order_items_res {
-        if let Err(rollback_err) = transaction.rollback().await {
-            error!(
-                "Failed to rollback transaction after create items error error: {:?}",
-                rollback_err
-            );
-        }
-        error!("Create items error: {err}");
+    data.cache
+        .lock()
+        .await
+        .update_record(created_order_uuid, order);
 
-        return Err(handle_create_order_items(err));
-    }
-
+    // Commit транзакции
     transaction.commit().await.map_err(|err| {
         error!("Failed to commit transaction: {:?}", err);
 
@@ -115,16 +117,15 @@ pub async fn get_order_handler(
     State(data): State<Arc<AppState>>,
 ) -> Result<(StatusCode, Json<GetOrderDTO>), (StatusCode, Json<serde_json::Value>)> {
     let mut client_db = data.db.lock().await;
+    if let Some(cached_item) = data.cache.lock().await.get_record(id) {
+        return Ok((StatusCode::OK, Json(cached_item.data)));
+    }
 
-    let order_row = match get_order_row(&mut client_db, id).await {
+    // Получение order
+    let order_row = match OrderService::get_one_by_id(&mut client_db, id).await {
         Ok(row) => row,
         Err(err) => {
-            error!("Order query error: {err}");
-
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "Order query error"})),
-            ));
+            return Err(handle_get_request_error(err, "Get order error").await);
         }
     };
     if order_row.is_empty() {
@@ -134,39 +135,27 @@ pub async fn get_order_handler(
         ));
     }
 
-    let payment_row = match get_payment_row(&mut client_db, id).await {
+    // Получение payment
+    let payment_row = match PaymentService::get_one_by_id(&mut client_db, id).await {
         Ok(row) => row,
         Err(err) => {
-            error!("Payment query error: {err}");
-
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "Payment query erro"})),
-            ));
+            return Err(handle_get_request_error(err, "Payment query error").await);
         }
     };
 
-    let delivery_row = match get_deliver_row(&mut client_db, id).await {
+    // Получение delivery
+    let delivery_row = match DeliveryService::get_one_by_id(&mut client_db, id).await {
         Ok(row) => row,
         Err(err) => {
-            error!("Delivery query error: {err}");
-
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "Delivery query erro"})),
-            ));
+            return Err(handle_get_request_error(err, "Delivery query error").await);
         }
     };
 
-    let order_item_rows = match get_item_rows(&mut client_db, id).await {
-        Ok(row) => row,
+    // Получение items
+    let order_item_rows = match OrderItemsService::get_many_by_id(&mut client_db, id).await {
+        Ok(rows) => rows,
         Err(err) => {
-            error!("Order items query error: {err}");
-
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "Order items query error"})),
-            ));
+            return Err(handle_get_request_error(err, "Order items query error").await);
         }
     };
 
@@ -176,231 +165,300 @@ pub async fn get_order_handler(
         .iter()
         .map(|item| OrderItemDTO::from(item))
         .collect();
-    let order = GetOrderDTO::from_row(&order_row, payment, delivery, order_items);
+    let order = GetOrderDTO::from_row(order_row, payment, delivery, order_items);
 
     info!("Get order {}", &id.to_string());
 
     return Ok((StatusCode::OK, Json(order)));
 }
 
-async fn get_payment_row(
-    client: &mut Client,
-    uuid: Uuid,
-) -> Result<tokio_postgres::Row, PostgresError> {
-    return client.query_one(
-        "SELECT transaction, request_id, currency, provider, amount, payment_dt, bank, delivery_cost, goods_total, custom_fee
-         FROM payment WHERE order_uid = $1",
-        &[&uuid],
-    ).await;
+// Типаж описывающий структуру запроса на получение элмента
+trait GetOneById {
+    async fn get_one_by_id(
+        client: &mut Client,
+        id: Uuid,
+    ) -> Result<tokio_postgres::Row, PostgresError>;
 }
 
-async fn get_order_row(
-    client: &mut Client,
-    uuid: Uuid,
-) -> Result<tokio_postgres::Row, PostgresError> {
-    return client
-        .query_one(
-            "SELECT order_uid, track_number, entry, locale,
-        internal_signature, customer_id, delivery_service,
-        shardkey, sm_id, date_created, oof_shard
-         FROM orders WHERE order_uid = $1",
-            &[&uuid],
-        )
-        .await;
+// Типаж описывающий структуру запроса на получение множества элементов
+trait GetManyById {
+    async fn get_many_by_id(
+        client: &mut Client,
+        id: Uuid,
+    ) -> Result<Vec<tokio_postgres::Row>, PostgresError>;
 }
 
-async fn get_item_rows(
-    client: &mut Client,
-    uuid: Uuid,
-) -> Result<Vec<tokio_postgres::Row>, PostgresError> {
-    return client
-        .query(
-            "SELECT chrt_id, track_number, price,
-             rid, name, sale, size,
-             total_price, nm_id, brand, status
-         FROM items WHERE order_uid = $1",
-            &[&uuid],
-        )
-        .await;
+// Типаж описывающий структуру запроса на создание элемента
+trait CreateOne<T, R>
+where
+    R: From<tokio_postgres::Row>,
+{
+    async fn create_one(
+        transaction: &mut Transaction<'_>,
+        body: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<R, AppError>;
 }
 
-async fn get_deliver_row(
-    client: &mut Client,
-    uuid: Uuid,
-) -> Result<tokio_postgres::Row, PostgresError> {
-    return client
-        .query_one(
-            "SELECT name, phone, zip, city, address, region, email
-         FROM delivery WHERE order_uid = $1",
-            &[&uuid],
-        )
-        .await;
+// Типаж описывающий структуру запроса на создание множества элемента
+trait CreateMany<T, R>
+where
+    R: From<tokio_postgres::Row>,
+{
+    async fn create_many(
+        transaction: &mut Transaction<'_>,
+        body: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<R>, AppError>;
 }
 
-// Добавление элементов заказа
-async fn create_order_items(
-    transaction: &mut Transaction<'_>,
-    items: &Vec<OrderItemDTO>,
-    order_uid: &Uuid,
-) -> Result<(), PostgresError> {
-    let mut query = String::from(
-        "INSERT INTO items (order_uid,
-            chrt_id, track_number, price,
-            rid, name, sale, size, total_price,
-            nm_id, brand, status
-        ) VALUES ",
-    );
-    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
-    for (i, item) in items.iter().enumerate() {
-        let param_start = i * 12 + 1;
-        query.push_str(&format!(
-            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}),",
-            param_start,      // order_uid
-            param_start + 1,  // chrt_id
-            param_start + 2,  // track_number
-            param_start + 3,  // price
-            param_start + 4,  // rid
-            param_start + 5,  // name
-            param_start + 6,  // sale
-            param_start + 7,  // size
-            param_start + 8,  // total_price
-            param_start + 9,  // nm_id
-            param_start + 10, // brand
-            param_start + 11, // status
-        ));
-
-        params.push(&order_uid);
-        params.push(&item.chrt_id);
-        params.push(&item.track_number);
-        params.push(&item.price);
-        params.push(&item.rid);
-        params.push(&item.name);
-        params.push(&item.sale);
-        params.push(&item.size);
-        params.push(&item.total_price);
-        params.push(&item.nm_id);
-        params.push(&item.brand);
-        params.push(&item.status);
+struct PaymentService();
+impl GetOneById for PaymentService {
+    async fn get_one_by_id(
+        client: &mut Client,
+        id: Uuid,
+    ) -> Result<tokio_postgres::Row, PostgresError> {
+        return client
+            .query_one(
+                "SELECT transaction, request_id, currency,
+                             provider, amount, payment_dt,
+                             bank, delivery_cost, goods_total, custom_fee
+                           FROM payment WHERE order_uid = $1",
+                &[&id],
+            )
+            .await;
     }
-    query.pop();
-
-    transaction.query(&query, &params).await?;
-
-    Ok(())
 }
-
-// Создание заказа
-async fn create_order(
-    transaction: &mut Transaction<'_>,
-    body: &CreateOrderDTO,
-) -> Result<Uuid, AppError> {
-    let create_order_stmt = transaction
-        .prepare(
-            "INSERT INTO orders (
-              track_number, entry, locale,
-              internal_signature, customer_id, delivery_service,
-              shardkey, sm_id, oof_shard
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING order_uid::varchar",
-        )
-        .await?;
-
-    let create_order_row = transaction
-        .query_one(
-            &create_order_stmt,
-            &[
-                &body.track_number,
-                &body.entry,
-                &body.locale,
-                &body.internal_signature,
-                &body.customer_id,
-                &body.delivery_service,
-                &body.shardkey,
-                &body.sm_id,
-                &body.oof_shard,
-            ],
-        )
-        .await?;
-
-    let order_uid_str: &str = create_order_row.get(0);
-    let order_uid = match Uuid::parse_str(order_uid_str) {
-        Ok(uid) => uid,
-        Err(err) => {
-            return Err(err)?;
-        }
-    };
-    Ok(order_uid)
-}
-
-// Создание доставки заказа
-async fn create_delivery(
-    transaction: &mut Transaction<'_>,
-    delivery: &DeliveryDTO,
-    order_uid: &Uuid,
-) -> Result<(), PostgresError> {
-    let create_delivery_stmt = transaction
-        .prepare(
-            "INSERT INTO delivery (
-              order_uid, name, phone,
-              zip, city, address,
-              region, email
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING delivery_id",
-        )
-        .await?;
-
-    transaction
-        .query_one(
-            &create_delivery_stmt,
-            &[
-                order_uid,
-                &delivery.name,
-                &delivery.phone,
-                &delivery.zip,
-                &delivery.city,
-                &delivery.address,
-                &delivery.region,
-                &delivery.email,
-            ],
-        )
-        .await?;
-
-    Ok(())
-}
-
-// Создание оплаты заказа
-async fn create_payment(
-    transaction: &mut Transaction<'_>,
-    payment: &PaymentDTO,
-    order_uid: &Uuid,
-) -> Result<(), PostgresError> {
-    let create_payment_stmt = transaction
-        .prepare(
-            "INSERT INTO payment (
+impl CreateOne<PaymentDTO, PaymentDTO> for PaymentService {
+    async fn create_one(
+        transaction: &mut Transaction<'_>,
+        body: &PaymentDTO,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<PaymentDTO, AppError> {
+        let create_payment_stmt = transaction
+            .prepare(
+                "INSERT INTO payment (
                         order_uid, transaction, request_id,
                         currency, provider, amount,
                         payment_dt, bank, delivery_cost,
                         goods_total, custom_fee
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING payment_id",
-        )
-        .await?;
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) 
+                  RETURNING 
+                        transaction, request_id, currency, provider, amount,
+                        payment_dt, bank, delivery_cost,
+                        goods_total, custom_fee",
+            )
+            .await?;
 
-    transaction
-        .execute(
-            &create_payment_stmt,
-            &[
-                order_uid,
-                &payment.transaction,
-                &payment.request_id,
-                &payment.currency,
-                &payment.provider,
-                &payment.amount,
-                &payment.payment_dt,
-                &payment.bank,
-                &payment.delivery_cost,
-                &payment.goods_total,
-                &payment.custom_fee,
-            ],
-        )
-        .await?;
+        let payment_row = transaction
+            .query_one(
+                &create_payment_stmt,
+                &[
+                    params[0],
+                    &body.transaction,
+                    &body.request_id,
+                    &body.currency,
+                    &body.provider,
+                    &body.amount,
+                    &body.payment_dt,
+                    &body.bank,
+                    &body.delivery_cost,
+                    &body.goods_total,
+                    &body.custom_fee,
+                ],
+            )
+            .await?;
 
-    Ok(())
+        Ok(PaymentDTO::from(payment_row))
+    }
+}
+
+struct OrderService();
+impl GetOneById for OrderService {
+    async fn get_one_by_id(
+        client: &mut Client,
+        id: Uuid,
+    ) -> Result<tokio_postgres::Row, PostgresError> {
+        return client
+            .query_one(
+                "SELECT order_uid, track_number, entry, locale,
+                        internal_signature, customer_id, delivery_service,
+                        shardkey, sm_id, date_created, oof_shard
+                        FROM orders WHERE order_uid = $1",
+                &[&id],
+            )
+            .await;
+    }
+}
+impl CreateOne<CreateOrderDTO, Order> for OrderService {
+    async fn create_one(
+        transaction: &mut Transaction<'_>,
+        body: &CreateOrderDTO,
+        _params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Order, AppError> {
+        let create_order_stmt = transaction
+            .prepare(
+                "INSERT INTO orders (
+              track_number, entry, locale,
+              internal_signature, customer_id, delivery_service,
+              shardkey, sm_id, oof_shard
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING 
+              order_uid, track_number, entry, locale,
+              internal_signature, customer_id, delivery_service,
+              sm_id, date_created, shardkey, oof_shard",
+            )
+            .await?;
+
+        let create_order_row = transaction
+            .query_one(
+                &create_order_stmt,
+                &[
+                    &body.track_number,
+                    &body.entry,
+                    &body.locale,
+                    &body.internal_signature,
+                    &body.customer_id,
+                    &body.delivery_service,
+                    &body.shardkey,
+                    &body.sm_id,
+                    &body.oof_shard,
+                ],
+            )
+            .await?;
+
+        Ok(Order::from(create_order_row))
+    }
+}
+
+struct OrderItemsService();
+impl GetManyById for OrderItemsService {
+    async fn get_many_by_id(
+        client: &mut Client,
+        id: Uuid,
+    ) -> Result<Vec<tokio_postgres::Row>, PostgresError> {
+        return client
+            .query(
+                "SELECT chrt_id, track_number, price,
+                            rid, name, sale, size,
+                            total_price, nm_id, brand, status
+                           FROM items WHERE order_uid = $1",
+                &[&id],
+            )
+            .await;
+    }
+}
+impl CreateMany<Vec<OrderItemDTO>, OrderItemDTO> for OrderItemsService {
+    async fn create_many(
+        transaction: &mut Transaction<'_>,
+        body: &Vec<OrderItemDTO>,
+        _params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<OrderItemDTO>, AppError> {
+        let mut query = String::from(
+            "INSERT INTO items (order_uid,
+            chrt_id, track_number, price,
+            rid, name, sale, size, total_price,
+            nm_id, brand, status
+        ) VALUES ",
+        );
+        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::new();
+        for (i, item) in body.iter().enumerate() {
+            let param_start = i * 12 + 1;
+            query.push_str(&format!(
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}),",
+                param_start,      // order_uid
+                param_start + 1,  // chrt_id
+                param_start + 2,  // track_number
+                param_start + 3,  // price
+                param_start + 4,  // rid
+                param_start + 5,  // name
+                param_start + 6,  // sale
+                param_start + 7,  // size
+                param_start + 8,  // total_price
+                param_start + 9,  // nm_id
+                param_start + 10, // brand
+                param_start + 11, // status
+            ));
+
+            params.push(_params[0]);
+            params.push(&item.chrt_id);
+            params.push(&item.track_number);
+            params.push(&item.price);
+            params.push(&item.rid);
+            params.push(&item.name);
+            params.push(&item.sale);
+            params.push(&item.size);
+            params.push(&item.total_price);
+            params.push(&item.nm_id);
+            params.push(&item.brand);
+            params.push(&item.status);
+        }
+        query.pop();
+        query.push_str(
+            " RETURNING 
+                    chrt_id, track_number, price,
+                    rid, name, sale, size, total_price,
+                    nm_id, brand, status
+            ",
+        );
+
+        let rows = transaction.query(&query, &params).await?;
+        let order_items: Vec<OrderItemDTO> =
+            rows.iter().map(|item| OrderItemDTO::from(item)).collect();
+
+        Ok(order_items)
+    }
+}
+
+struct DeliveryService();
+impl GetOneById for DeliveryService {
+    async fn get_one_by_id(
+        client: &mut Client,
+        id: Uuid,
+    ) -> Result<tokio_postgres::Row, PostgresError> {
+        return client
+            .query_one(
+                "SELECT name, phone, zip, city, address, region, email
+                            FROM delivery WHERE order_uid = $1",
+                &[&id],
+            )
+            .await;
+    }
+}
+impl CreateOne<DeliveryDTO, DeliveryDTO> for DeliveryService {
+    async fn create_one(
+        transaction: &mut Transaction<'_>,
+        body: &DeliveryDTO,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<DeliveryDTO, AppError> {
+        let create_delivery_stmt = transaction
+            .prepare(
+                "INSERT INTO delivery (
+              order_uid, name, phone,
+              zip, city, address,
+              region, email
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING
+              name, phone,
+              zip, city, address,
+              region, email",
+            )
+            .await?;
+
+        let create_delivery_row = transaction
+            .query_one(
+                &create_delivery_stmt,
+                &[
+                    params[0],
+                    &body.name,
+                    &body.phone,
+                    &body.zip,
+                    &body.city,
+                    &body.address,
+                    &body.region,
+                    &body.email,
+                ],
+            )
+            .await?;
+
+        Ok(DeliveryDTO::from(create_delivery_row))
+    }
 }
